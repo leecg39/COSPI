@@ -14,6 +14,8 @@ import {
   LogOut,
   Maximize2,
   Newspaper,
+  Pause,
+  Play,
   RefreshCw,
   Save,
   Search,
@@ -56,12 +58,19 @@ import type {
 
 type ViewKey = 'markets' | 'portfolio' | 'research' | 'chart' | 'orders' | 'ai' | 'settings'
 type PanelKey = 'left' | 'center' | 'right'
+type PanelWidthKey = Exclude<PanelKey, 'center'>
 type WidgetId = 'indices' | 'market-watch' | 'macro' | 'chart' | 'news' | 'dart' | 'financials' | 'portfolio' | 'executions' | 'options' | 'order' | 'ai' | 'settings'
 type ViewLayout = Record<PanelKey, WidgetId[]>
 type LayoutState = Record<ViewKey, ViewLayout>
-type PanelWidths = { left: number; right: number }
+type PanelWidths = Record<PanelWidthKey, number> & { manual?: boolean }
 type WidgetSize = { width?: number; height?: number }
 type WidgetSizeState = Record<ViewKey, Partial<Record<WidgetId, WidgetSize>>>
+
+const panelSplitterWidth = 8
+const panelWidthBounds = {
+  left: { min: 300, max: 460, ratio: 0.24 },
+  right: { min: 300, max: 430, ratio: 0.21 },
+}
 
 const views: Array<{ id: ViewKey; label: string; icon: typeof Activity }> = [
   { id: 'markets', label: '시장', icon: Activity },
@@ -103,7 +112,7 @@ const widgetTitles: Record<WidgetId, string> = {
 
 const stateLabel: Record<DataState, string> = {
   REALTIME: '실시간',
-  NEAR_REALTIME: '근실시간',
+  NEAR_REALTIME: '실시간',
   DELAYED: '지연',
   API_REQUIRED: 'API 필요',
   NO_DATA: '데이터 없음',
@@ -178,9 +187,34 @@ const loadLayout = (userId?: string | null): LayoutState => {
   return normalizeLayout(legacy)
 }
 
+const clampPanelWidth = (panel: PanelWidthKey, width: number) => {
+  const bounds = panelWidthBounds[panel]
+  return Math.min(bounds.max, Math.max(bounds.min, Math.round(width)))
+}
+
+const defaultPanelWidths = (): PanelWidths => {
+  const viewportWidth = typeof window === 'undefined' ? 1900 : window.innerWidth
+  const usableWidth = Math.max(0, viewportWidth - panelSplitterWidth * 2)
+
+  return {
+    left: clampPanelWidth('left', usableWidth * panelWidthBounds.left.ratio),
+    right: clampPanelWidth('right', usableWidth * panelWidthBounds.right.ratio),
+  }
+}
+
 const loadPanelWidths = (userId?: string | null): PanelWidths => {
-  const saved = readStored<Partial<PanelWidths>>(storageKey('cospi-panel-widths-v2', userId), readStored('cospi-panel-widths-v1', {}))
-  return { left: 300, right: 360, ...saved }
+  const defaults = defaultPanelWidths()
+  const saved = readStored<Partial<PanelWidths>>(storageKey('cospi-panel-widths-v4', userId), {})
+
+  if (saved.manual && saved.left && saved.right) {
+    return {
+      manual: true,
+      left: clampPanelWidth('left', saved.left),
+      right: clampPanelWidth('right', saved.right),
+    }
+  }
+
+  return defaults
 }
 
 const loadWidgetSizes = (userId?: string | null): WidgetSizeState => {
@@ -356,23 +390,65 @@ const WidgetFrame = ({
   )
 }
 
-const TickerStrip = ({ quotes, onSelect }: { quotes: Quote[]; onSelect: (symbol: string) => void }) => (
-  <div className="ticker-strip" aria-label="주요 지수 틱 테이프">
-    {quotes.length ? (
-      quotes.map((quote) => (
-        <button type="button" key={quote.symbol} className="ticker-item" onClick={() => onSelect(quote.symbol)}>
-          <span className="ticker-symbol">{quote.symbol}</span>
-          <span>{quote.name}</span>
+const tickerLabel = (quote: Quote) => quote.name.replace(/\([^)]*\)/g, '').replace(/\s*환율$/, '').replace(/\s*금리$/, '').trim() || quote.symbol
+
+const TickerItems = ({ quotes, onSelect, duplicate = false }: { quotes: Quote[]; onSelect: (symbol: string) => void; duplicate?: boolean }) => (
+  <>
+    {quotes.map((quote, index) => {
+      const direction = quote.change == null ? 'flat' : quote.change < 0 ? 'down' : 'up'
+      const changeLabel = quote.change == null ? '--' : `${direction === 'down' ? '▼' : '▲'} ${formatNumber(quote.change, displayDigits(quote))}`
+
+      return (
+        <button
+          type="button"
+          key={`${duplicate ? 'copy' : 'main'}-${quote.symbol}-${index}`}
+          className="ticker-item"
+          onClick={() => onSelect(quote.symbol)}
+          tabIndex={duplicate ? -1 : undefined}
+          aria-hidden={duplicate || undefined}
+        >
+          <span className="ticker-symbol">{tickerLabel(quote)}</span>
           <strong>{formatNumber(quote.price, displayDigits(quote))}</strong>
-          <span className={quote.changeRate != null && quote.changeRate < 0 ? 'down' : 'up'}>{formatPercent(quote.changeRate)}</span>
-          <StatusBadge source={quote.source} />
+          <span className={direction}>{changeLabel}</span>
+          <span className={direction}>{formatPercent(quote.changeRate)}</span>
         </button>
-      ))
-    ) : (
-      <span className="ticker-empty">시세 대기</span>
-    )}
-  </div>
+      )
+    })}
+  </>
 )
+
+const TickerStrip = ({ quotes, onSelect }: { quotes: Quote[]; onSelect: (symbol: string) => void }) => {
+  const [isPaused, setIsPaused] = useState(false)
+
+  return (
+    <div className="ticker-strip" data-paused={isPaused} aria-label="주요 지수 틱 테이프">
+      <button
+        type="button"
+        className="ticker-control"
+        onClick={() => setIsPaused((value) => !value)}
+        disabled={!quotes.length}
+        aria-label={isPaused ? '티커 재생' : '티커 일시정지'}
+        aria-pressed={isPaused}
+      >
+        {isPaused ? <Play size={13} /> : <Pause size={13} />}
+      </button>
+      <div className="ticker-viewport">
+        {quotes.length ? (
+          <div className="ticker-track">
+            <div className="ticker-sequence">
+              <TickerItems quotes={quotes} onSelect={onSelect} />
+            </div>
+            <div className="ticker-sequence" aria-hidden>
+              <TickerItems quotes={quotes} onSelect={onSelect} duplicate />
+            </div>
+          </div>
+        ) : (
+          <span className="ticker-empty">시세 대기</span>
+        )}
+      </div>
+    </div>
+  )
+}
 
 const MarketWatch = ({ quotes, onSelect }: { quotes: Quote[]; onSelect: (symbol: string) => void }) => (
   <div className="table-wrap">
@@ -450,18 +526,18 @@ const useChart = (payload: ChartPayload | null) => {
     container.innerHTML = ''
     const chart = createChart(container, {
       layout: {
-        background: { type: ColorType.Solid, color: '#ffffff' },
-        textColor: '#5b616e',
+        background: { type: ColorType.Solid, color: '#0f131a' },
+        textColor: '#aab4c3',
       },
       grid: {
-        vertLines: { color: '#eef0f3' },
-        horzLines: { color: '#eef0f3' },
+        vertLines: { color: '#232b37' },
+        horzLines: { color: '#232b37' },
       },
       rightPriceScale: {
-        borderColor: '#dedfe2',
+        borderColor: '#303947',
       },
       timeScale: {
-        borderColor: '#dedfe2',
+        borderColor: '#303947',
         timeVisible: true,
       },
       crosshair: {
@@ -503,10 +579,10 @@ const useChart = (payload: ChartPayload | null) => {
     const ma20 = movingAverage(payload.candles, 20)
     const ma60 = movingAverage(payload.candles, 60)
     const bands = bollingerBands(payload.candles)
-    chart.addSeries(LineSeries, { color: '#0052ff', lineWidth: 1 }).setData(ma20.map((point) => ({ time: point.time as Time, value: point.value })))
-    chart.addSeries(LineSeries, { color: '#141519', lineWidth: 1 }).setData(ma60.map((point) => ({ time: point.time as Time, value: point.value })))
-    chart.addSeries(LineSeries, { color: 'rgba(91,97,110,.34)', lineWidth: 1 }).setData(bands.map((point) => ({ time: point.time as Time, value: point.upper })))
-    chart.addSeries(LineSeries, { color: 'rgba(91,97,110,.34)', lineWidth: 1 }).setData(bands.map((point) => ({ time: point.time as Time, value: point.lower })))
+    chart.addSeries(LineSeries, { color: '#5b8cff', lineWidth: 1 }).setData(ma20.map((point) => ({ time: point.time as Time, value: point.value })))
+    chart.addSeries(LineSeries, { color: '#d8e1ee', lineWidth: 1 }).setData(ma60.map((point) => ({ time: point.time as Time, value: point.value })))
+    chart.addSeries(LineSeries, { color: 'rgba(170,180,195,.34)', lineWidth: 1 }).setData(bands.map((point) => ({ time: point.time as Time, value: point.upper })))
+    chart.addSeries(LineSeries, { color: 'rgba(170,180,195,.34)', lineWidth: 1 }).setData(bands.map((point) => ({ time: point.time as Time, value: point.lower })))
     chart.timeScale().fitContent()
 
     return () => chart.remove()
@@ -1439,7 +1515,7 @@ function App() {
   const displayQuotes = quotes.filter((quote) => watchlist.includes(quote.symbol))
   const latestNews = newsItems[0] || null
   const activeLayout = layout[activeView]
-  const tickerQuotes = [...indices, ...displayQuotes]
+  const tickerQuotes = [...macroItems, ...indices, ...displayQuotes].filter((quote) => quote.price != null)
 
   useEffect(() => {
     api
@@ -1462,7 +1538,7 @@ function App() {
   }, [layout, user?.id])
 
   useEffect(() => {
-    localStorage.setItem(storageKey('cospi-panel-widths-v2', user?.id || null), JSON.stringify(panelWidths))
+    localStorage.setItem(storageKey('cospi-panel-widths-v4', user?.id || null), JSON.stringify(panelWidths))
   }, [panelWidths, user?.id])
 
   useEffect(() => {
@@ -1646,13 +1722,15 @@ function App() {
       if (panel === 'left') {
         setPanelWidths((current) => ({
           ...current,
-          left: Math.min(460, Math.max(220, event.clientX - rect.left)),
+          manual: true,
+          left: clampPanelWidth('left', event.clientX - rect.left),
         }))
       }
       if (panel === 'right') {
         setPanelWidths((current) => ({
           ...current,
-          right: Math.min(520, Math.max(260, rect.right - event.clientX)),
+          manual: true,
+          right: clampPanelWidth('right', rect.right - event.clientX),
         }))
       }
     }
@@ -1895,7 +1973,7 @@ function App() {
         ref={terminalRef}
         className="terminal-grid"
         style={{
-          gridTemplateColumns: `${panelWidths.left}px 6px minmax(430px, 1fr) 6px ${panelWidths.right}px`,
+          gridTemplateColumns: `${panelWidths.left}px ${panelSplitterWidth}px minmax(0, 1fr) ${panelSplitterWidth}px ${panelWidths.right}px`,
         }}
       >
         {renderPanel('left')}
